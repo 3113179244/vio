@@ -2,6 +2,7 @@
 #include "projection_factor.h"
 #include "imu_factor.h"
 #include <ceres/ceres.h>
+#include "utility.h"
 
 // 三维向量转反对称矩阵的辅助函数
 Eigen::Matrix3d skewSymmetric(const Eigen::Vector3d &v)
@@ -60,8 +61,10 @@ void Estimator::processMeasurement(const MeasurementPackage &package)
     for (const auto &imu : package.imus)
     {
         double dt = 0.005;
-        if (!first_imu) dt = imu.timestamp - last_imu_time;
-        else first_imu = false;
+        if (!first_imu)
+            dt = imu.timestamp - last_imu_time;
+        else
+            first_imu = false;
         last_imu_time = imu.timestamp;
 
         // 全局递推（用于提供优化的状态初始迭代值）
@@ -70,10 +73,10 @@ void Estimator::processMeasurement(const MeasurementPackage &package)
         // 局部增量预积分计算
         Eigen::Vector3d un_gyr = imu.gyr - Bgs[current_frame_idx];
         Eigen::Vector3d un_acc = imu.acc - Bas[current_frame_idx];
-        
+
         dt_sum += dt;
-        delta_q = delta_q * Eigen::Quaterniond(Eigen::Matrix3d::Identity() + skewSymmetric(un_gyr) * dt);
-        
+        delta_q = delta_q * utility::quaternionExpMap(un_gyr * dt);
+
         // 依照动力学方程在中值进行局部测量累积
         delta_v += delta_q * un_acc * dt;
         delta_p += delta_v * dt + (delta_q * un_acc) * (0.5 * dt * dt);
@@ -121,7 +124,7 @@ void Estimator::processImage(const std::map<int, Eigen::Vector2d> &image_msg, do
             FeaturePerId new_feature;
             new_feature.feature_id = feature_id;
             new_feature.start_frame = current_frame_idx;
-            new_feature.estimated_depth = 1.0; 
+            new_feature.estimated_depth = 1.0;
             new_feature.feature_per_frame.push_back({point_uv});
             feature_manager[feature_id] = new_feature;
         }
@@ -177,26 +180,33 @@ void Estimator::optimization()
     std::cout << "[Ceres Optimizer] Constructing Non-linear Factor Graph Optimization..." << std::endl;
 
     ceres::Problem problem;
-    ceres::LossFunction *loss_function = new ceres::HuberLoss(1.0); 
+    ceres::LossFunction *loss_function = new ceres::HuberLoss(1.0);
 
     // 1. 参数块格式化转换
     double para_Pose[WINDOW_SIZE + 1][7];
     double para_Speed[WINDOW_SIZE + 1][3];
-    
+
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
-        para_Pose[i][0] = Ps[i].x(); para_Pose[i][1] = Ps[i].y(); para_Pose[i][2] = Ps[i].z();
+        para_Pose[i][0] = Ps[i].x();
+        para_Pose[i][1] = Ps[i].y();
+        para_Pose[i][2] = Ps[i].z();
         Eigen::Quaterniond q(Rs[i]);
-        para_Pose[i][3] = q.x(); para_Pose[i][4] = q.y(); para_Pose[i][5] = q.z(); para_Pose[i][6] = q.w();
+        para_Pose[i][3] = q.x();
+        para_Pose[i][4] = q.y();
+        para_Pose[i][5] = q.z();
+        para_Pose[i][6] = q.w();
         problem.AddParameterBlock(para_Pose[i], 7);
 
-        para_Speed[i][0] = Vs[i].x(); para_Speed[i][1] = Vs[i].y(); para_Speed[i][2] = Vs[i].z();
+        para_Speed[i][0] = Vs[i].x();
+        para_Speed[i][1] = Vs[i].y();
+        para_Speed[i][2] = Vs[i].z();
         problem.AddParameterBlock(para_Speed[i], 3);
     }
 
-    double para_Ex_Pose[7] = {TIC.x(), TIC.y(), TIC.z(), RIC(0,0), RIC(1,0), RIC(2,0), 1.0};
+    double para_Ex_Pose[7] = {TIC.x(), TIC.y(), TIC.z(), RIC(0, 0), RIC(1, 0), RIC(2, 0), 1.0};
     problem.AddParameterBlock(para_Ex_Pose, 7);
-    problem.SetParameterBlockConstant(para_Ex_Pose); 
+    problem.SetParameterBlockConstant(para_Ex_Pose);
 
     // 💡【核心基准固定】：强行将滑窗第 0 帧锁死在基准原点，作为基准参照物防止整体漂移坍塌
     problem.SetParameterBlockConstant(para_Pose[0]);
@@ -206,9 +216,9 @@ void Estimator::optimization()
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         int j = i + 1;
-        
+
         // 从类缓冲区中提取当前时间包内真实的 IMU 积分度量值
-        double dT = dt_buf[i]; 
+        double dT = dt_buf[i];
         Eigen::Vector3d real_dp = delta_p_buf[i];
         Eigen::Vector3d real_dv = delta_v_buf[i];
         Eigen::Quaterniond real_dq = delta_q_buf[i];
@@ -225,7 +235,8 @@ void Estimator::optimization()
     for (auto &it : feature_manager)
     {
         auto &feature = it.second;
-        if (feature.feature_per_frame.size() < 2) continue;
+        if (feature.feature_per_frame.size() < 2)
+            continue;
 
         int i = feature.start_frame;
         Eigen::Vector2d pts_i = feature.feature_per_frame[0].point;
@@ -233,7 +244,8 @@ void Estimator::optimization()
         for (size_t idx = 1; idx < feature.feature_per_frame.size(); idx++)
         {
             int j = i + idx;
-            if (j > WINDOW_SIZE) continue; 
+            if (j > WINDOW_SIZE)
+                continue;
 
             Eigen::Vector2d pts_j = feature.feature_per_frame[idx].point;
 

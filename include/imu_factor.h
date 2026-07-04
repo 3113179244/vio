@@ -40,9 +40,15 @@ public:
         Eigen::Quaternion<T> res_q = delta_q_T.inverse() * (Qi.inverse() * Qj);
 
         // 4. 将计算出来的 9 维残差填入输出数组
-        residuals[0] = res_p.x(); residuals[1] = res_p.y(); residuals[2] = res_p.z();
-        residuals[3] = res_v.x(); residuals[4] = res_v.y(); residuals[5] = res_v.z();
-        residuals[6] = res_q.x() * T(2.0); residuals[7] = res_q.y() * T(2.0); residuals[8] = res_q.z() * T(2.0);
+        residuals[0] = res_p.x();
+        residuals[1] = res_p.y();
+        residuals[2] = res_p.z();
+        residuals[3] = res_v.x();
+        residuals[4] = res_v.y();
+        residuals[5] = res_v.z();
+        residuals[6] = res_q.x() * T(2.0);
+        residuals[7] = res_q.y() * T(2.0);
+        residuals[8] = res_q.z() * T(2.0);
 
         return true;
     }
