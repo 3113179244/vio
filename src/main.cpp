@@ -10,7 +10,7 @@
 #include "parameters.h"
 #include "data_manager.h"
 #include "feature_tracker.h"
-
+#include "estimator.h" 
 // 定义数据集根目录
 const std::string DATASET_PATH = "/home/wzj/TUM/dataset-corridor1_512_16/mav0/";
 
@@ -140,19 +140,22 @@ void vioProcessThread(DataManager *data_manager)
 {
     std::cout << "[Back-End VIO] Backend optimization thread started." << std::endl;
 
-    int frame_count = 0;
-    size_t total_imu_count = 0;
+    // 1. 实例化我们刚刚写好的后端主估计器
+    Estimator estimator;
 
     while (true)
     {
         MeasurementPackage package;
 
-        // 核心对齐阻塞接口：醒来时，代表拿到了一帧干净、且严格与 IMU 同步的数据包
+        // 2. 核心对齐阻塞接口：醒来时，代表拿到了一帧干净、且严格与 IMU 同步的数据包
         if (data_manager->getMeasurements(package))
         {
+            // 3. 直接将同步数据包丢进 estimator 状态机
+            estimator.processMeasurement(package);
         }
     }
 }
+
 
 int main(int argc, char **argv)
 {
