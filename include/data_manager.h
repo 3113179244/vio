@@ -7,6 +7,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
+#include <map>
 #include <opencv2/opencv.hpp>
 #include <Eigen/Dense>
 
@@ -18,14 +19,15 @@ struct ImuMeasurement
     Eigen::Vector3d gyr; // 角速度
 };
 
-// 图像数据结构体
+// 图像与视觉特征点数据结构体
 struct ImageMeasurement
 {
     double timestamp;
-    cv::Mat image;
+    cv::Mat image; // 原始图像
+    std::map<int, Eigen::Vector2d> feature_points; // 新增：前端追踪出来的去畸变特征点集合！
 };
 
-// 传感器同步数据包（一帧图像以及其与上一帧之间的所有 IMU 数据）
+// 传感器同步数据包（一帧图像、对应的特征点，以及它与上一帧之间的所有 IMU 数据）
 struct MeasurementPackage
 {
     ImageMeasurement image;
@@ -42,19 +44,18 @@ public:
     DataManager(const DataManager &) = delete;
     DataManager &operator=(const DataManager &) = delete;
 
-    // 输入接口：由数据读取线程（或外部主线程）调用，向队列中灌入数据
+    // 输入接口
     void inputImu(double timestamp, const Eigen::Vector3d &acc, const Eigen::Vector3d &gyr);
-    void inputImage(double timestamp, const cv::Mat &image);
+    // 修改接口：不仅输入时间戳和图像，同时输入追踪好的特征点
+    void inputImage(double timestamp, const cv::Mat &image, const std::map<int, Eigen::Vector2d> &features);
 
-    // 输出接口：由 VIO 后端优化线程调用，获取对齐后的同步数据包
-    // 如果队列中没有可用数据，该函数会阻塞，直到有新数据满足对齐条件
+    // 输出接口
     bool getMeasurements(MeasurementPackage &package);
 
     // 清空缓存
     void clear();
 
 private:
-    // 判断当前传感器数据是否能够打包对齐
     bool hasValidMeasurements();
 
     std::queue<ImuMeasurement> imu_buf_;

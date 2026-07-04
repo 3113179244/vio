@@ -8,10 +8,11 @@ void DataManager::inputImu(double timestamp, const Eigen::Vector3d &acc, const E
     cond_.notify_one(); // 唤醒可能正在等待数据的后端线程
 }
 
-void DataManager::inputImage(double timestamp, const cv::Mat &image)
+// 修复点：这里的实现必须与头文件严格一致，接收并打包 features 集合
+void DataManager::inputImage(double timestamp, const cv::Mat &image, const std::map<int, Eigen::Vector2d> &features)
 {
     std::unique_lock<std::mutex> lock(mutex_);
-    ImageMeasurement img{timestamp, image.clone()}; // 使用 clone 防止外部内存释放
+    ImageMeasurement img{timestamp, image.clone(), features}; // 使用 features 构造结构体
     image_buf_.push(img);
     cond_.notify_one();
 }
@@ -49,36 +50,32 @@ bool DataManager::getMeasurements(MeasurementPackage &package)
     cond_.wait(lock, [this]()
                { return hasValidMeasurements(); });
 
-    // 1. 提取当前最前面的图像帧
+    // 1. 提取当前最前面的图像帧（内部已包含特征点）
     package.image = image_buf_.front();
     image_buf_.pop();
 
     package.imus.clear();
-    // 2. 提取当前图像帧之前的所有 IMU 数据（包含与当前图像时间戳最接近的那一帧）
-    // 注意：这里保留 <= 图像时间戳的 IMU 数据。
-    // 为了使下一帧图像做预积分时连续，这一帧 IMU 的数据通常在处理完后不需要从 imu_buf 中彻底抹去，或者留作下一帧的起点。
-    // 下面是一种常见的标准做法：把当前图像时间戳之前的 IMU 提取出来。
+    
+    // 2. 提取当前图像帧之前的所有 IMU 数据
     while (!imu_buf_.empty() && imu_buf_.front().timestamp <= package.image.timestamp)
     {
         package.imus.push_back(imu_buf_.front());
 
-        // 如果是最后一帧接近图像时间戳的 IMU，我们可以保留它在队列中，作为下一帧图像预积分的起点
+        // 如果当前 IMU 时间戳恰好等于图像时间戳，说明对齐到了完美边界
         if (imu_buf_.front().timestamp == package.image.timestamp)
         {
+            imu_buf_.pop();
             break;
         }
 
-        // 如果当前 IMU 时间已经大于等于下一帧可能用到的范围（或紧邻当前图像），在严格对齐时可以保留最后一帧
-        if (imu_buf_.size() > 1 && imu_buf_.queue::front().timestamp < package.image.timestamp)
+        // 如果当前 IMU 的下一条数据依然小于当前图像时间戳，说明当前这条是安全的旧数据，直接弹出
+        if (imu_buf_.size() > 1)
         {
-            // 如果下一个 IMU 已经超过了当前图像时间戳，说明当前 IMU 是图象前的最后一帧
-            auto it_next = imu_buf_.front();
-            // 简单起见，通常直接把小于当前图像时间戳的 IMU 全部 pop 掉
             imu_buf_.pop();
         }
         else
         {
-            // 如果只剩一个或者正好等于，保留不 pop（或者直接 pop，取决于你的预积分插值策略）
+            // 如果 buffer 里面只剩这一条数据了，弹出并结束
             imu_buf_.pop();
             break;
         }
