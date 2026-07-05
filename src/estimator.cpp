@@ -75,7 +75,7 @@ void Estimator::processMeasurement(const MeasurementPackage &package)
         Eigen::Vector3d un_acc = imu.acc - Bas[current_frame_idx];
 
         dt_sum += dt;
-        delta_q = delta_q * utility::quaternionExpMap(un_gyr * dt);
+        delta_q = delta_q * Sophus::SO3d::exp(un_gyr * dt).unit_quaternion();
 
         // 依照动力学方程在中值进行局部测量累积
         delta_v += delta_q * un_acc * dt;

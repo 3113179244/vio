@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10) 
 project(mini_vio) 
 
-set(CMAKE_CXX_STANDARD 14) 
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON) 
 
 find_package(Eigen3 REQUIRED) 
@@ -15,12 +15,14 @@ find_package(Ceres REQUIRED)
 # 寻找 Pangolin 库（3D 交互式可视化所需）
 find_package(Pangolin REQUIRED)
 
+find_package(Sophus REQUIRED)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include 
     ${EIGEN3_INCLUDE_DIR} 
     ${OpenCV_INCLUDE_DIRS}
     ${CERES_INCLUDE_DIRS}
     ${PANGOLIN_INCLUDE_DIRS}
+    ${Sophus_INCLUDE_DIRS}
 )
 
 add_library(${PROJECT_NAME}_lib STATIC
@@ -59,4 +61,5 @@ target_link_libraries(main
     ${OpenCV_LIBS}
     ${CERES_LIBRARIES}
     ${PANGOLIN_LIBRARIES}
+    Sophus::Sophus
 )

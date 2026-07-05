@@ -47,7 +47,7 @@ private:
     std::vector<cv::Point2f> cur_pts_;
     std::vector<cv::Point2f> forw_pts_;
     std::vector<cv::Point2f> n_pts_; // 新提取的点
-
+    std::map<int, Eigen::Vector2d> prev_un_pts_map_;
     // 特征点 ID 管理
     std::vector<int> ids_;
     std::vector<int> track_cnt_; // 每个点被追踪的帧数（用于后端判断是否稳定）
