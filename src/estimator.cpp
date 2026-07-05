@@ -2,128 +2,301 @@
 #include "projection_factor.h"
 #include <ceres/ceres.h>
 #include <Eigen/Dense>
+#include <opencv2/opencv.hpp>
 #include <iostream>
 #include <map>
+#include <vector>
 
-// 辅助函数：三维向量转反对称矩阵（虽然纯视觉不用，但保留以维持结构完整）
-Eigen::Matrix3d skewSymmetric(const Eigen::Vector3d &v)
+// 辅助函数：将 Eigen 的 R, T 转换为 OpenCV 矩阵格式
+void eigen2cv(const Eigen::Matrix3d &R, const Eigen::Vector3d &T, cv::Mat &cv_R, cv::Mat &cv_T)
 {
-    Eigen::Matrix3d m;
-    m << 0, -v.z(), v.y(),
-         v.z(),    0, -v.x(),
-        -v.y(),  v.x(),    0;
-    return m;
+    cv_R = (cv::Mat_<double>(3, 3) << R(0,0), R(0,1), R(0,2), R(1,0), R(1,1), R(1,2), R(2,0), R(2,1), R(2,2));
+    cv_T = (cv::Mat_<double>(3, 1) << T.x(), T.y(), T.z());
 }
 
-// 构造函数：初始化滑窗内状态量
+void cv2eigen(const cv::Mat &cv_R, const cv::Mat &cv_T, Eigen::Matrix3d &R, Eigen::Vector3d &T)
+{
+    R << cv_R.at<double>(0,0), cv_R.at<double>(0,1), cv_R.at<double>(0,2),
+         cv_R.at<double>(1,0), cv_R.at<double>(1,1), cv_R.at<double>(1,2),
+         cv_R.at<double>(2,0), cv_R.at<double>(2,1), cv_R.at<double>(2,2);
+    T << cv_T.at<double>(0,0), cv_T.at<double>(1,0), cv_T.at<double>(2,0);
+}
+
+// 纯视觉三角化基础函数（计算三维坐标）
+Eigen::Vector3d triangulatePoint(const Eigen::Matrix3d &R0, const Eigen::Vector3d &T0,
+                                 const Eigen::Matrix3d &R1, const Eigen::Vector3d &T1,
+                                 const Eigen::Vector2d &pt0, const Eigen::Vector2d &pt1)
+{
+    Eigen::Matrix4d P0, P1;
+    P0.block<3,3>(0,0) = R0.transpose(); P0.block<3,1>(0,3) = -R0.transpose() * T0;
+    P1.block<3,3>(0,0) = R1.transpose(); P1.block<3,1>(0,3) = -R1.transpose() * T1;
+    
+    Eigen::Matrix4d A;
+    A.row(0) = pt0.x() * P0.row(2) - P0.row(0);
+    A.row(1) = pt0.y() * P0.row(2) - P0.row(1);
+    A.row(2) = pt1.x() * P1.row(2) - P1.row(0);
+    A.row(3) = pt1.y() * P1.row(2) - P1.row(1);
+
+    Eigen::JacobiSVD<Eigen::Matrix4d> svd(A, Eigen::ComputeFullV);
+    Eigen::Vector4d x_homo = svd.matrixV().col(3);
+    return x_homo.head<3>() / x_homo(3);
+}
+
+// ==========================================
+// 1. 构造函数
+// ==========================================
 Estimator::Estimator()
 {
-    std::cout << "[Estimator] 正在初始化纯视觉滑窗后端估计器..." << std::endl;
+    std::cout << "[Estimator] 初始化纯视觉滑窗后端估计器 (无恒速模型)..." << std::endl;
     solver_flag = INITIAL;
     frame_count = 0;
+    first_imu = true;
+    last_imu_time = 0.0;
 
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
         Ps[i].setZero();
+        Vs[i].setZero();
         Rs[i].setIdentity();
+        Bas[i].setZero();
+        Bgs[i].setZero();
     }
     feature_manager.clear();
 }
 
-// 后端处理数据包的总入口
+// 补齐头文件声明的成员函数，保持结构完整
+void Estimator::processIMU(double dt, const Eigen::Vector3d &linear_acceleration, const Eigen::Vector3d &angular_velocity)
+{
+    // 纯视觉模式下此函数留空
+}
+
+// 数据处理入口
 void Estimator::processMeasurement(const MeasurementPackage &package)
 {
-    std::cout << "\n[Backend] ====== 开始处理同步数据包 ======" << std::endl;
-    
-    // 纯视觉模式下，跳过 processIMU 递推，直接推进视觉状态机
+    std::cout << "\n[Backend Estimator] ====== 开始处理同步数据包 ======" << std::endl;
     processImage(package.image.feature_points, package.image.timestamp);
 }
 
-// 视觉状态机更新：管理滑窗帧数，触发优化与滑窗边缘化
+// ==========================================
+// 2. 视觉状态机更新
+// ==========================================
 void Estimator::processImage(const std::map<int, Eigen::Vector2d> &image_msg, double header_time)
 {
-    std::cout << "[Backend] 当前帧追踪到的特征点数量: " << image_msg.size() << std::endl;
+    std::cout << "[Backend Estimator] 当前帧追踪到的特征点数量: " << image_msg.size() << std::endl;
 
-    // 1. 将当前帧的特征点观测信息，录入到全局特征管理器（Feature Manager）中
     int current_frame_idx = (frame_count < WINDOW_SIZE) ? frame_count : WINDOW_SIZE;
     for (const auto &pts : image_msg)
     {
         int feature_id = pts.first;
-        Eigen::Vector2d point_uv = pts.second; // 已经是前端去畸变后的归一化平面坐标
+        Eigen::Vector2d point_uv = pts.second;
 
         if (feature_manager.find(feature_id) == feature_manager.end())
         {
-            // 如果是新出现的特征点，为其创建管理器节点
             FeaturePerId new_feature;
             new_feature.feature_id = feature_id;
-            new_feature.start_frame = current_frame_idx; // 记录它的起始帧
-            new_feature.estimated_depth = 1.0;          // 初始深度默认设为 1.0
+            new_feature.start_frame = current_frame_idx;
+            new_feature.estimated_depth = 1.0; // 默认初始逆深度
             new_feature.feature_per_frame.push_back({point_uv});
             feature_manager[feature_id] = new_feature;
         }
         else
         {
-            // 如果是老特征点，追加当前帧的观测记录
             feature_manager[feature_id].feature_per_frame.push_back({point_uv});
         }
     }
 
-    // 2. 判断滑动窗口是否已满
     if (frame_count < WINDOW_SIZE)
     {
         Headers[frame_count] = header_time;
         frame_count++;
-        std::cout << "[Backend] 窗口未满，正在收集帧数... 当前进度: " << frame_count << "/" << WINDOW_SIZE << std::endl;
+        std::cout << "[Backend Estimator] 窗口未满... 当前进度: " << frame_count << "/" << WINDOW_SIZE << std::endl;
     }
     else
     {
         Headers[WINDOW_SIZE] = header_time;
 
-        // 如果系统还未建立初始结构，先进行简单初始化
         if (solver_flag == INITIAL)
         {
-            std::cout << "[Backend] 窗口已满，触发系统初始化..." << std::endl;
+            std::cout << "[Backend Estimator] 窗口已满，开始 SfM 初始化..." << std::endl;
             if (initialStructure())
             {
-                solver_flag = NON_LINEAR; // 切换至正规非线性优化状态
-                std::cout << "[Backend] 系统初始化成功，进入非线性优化阶段！" << std::endl;
+                solver_flag = NON_LINEAR; 
+                std::cout << "[Backend Estimator] SfM 初始化成功，进入非线性优化状态！" << std::endl;
+                optimization(); 
             }
-            slideWindow(); // 边缘化老帧，腾出空间
+            slideWindow();
         }
         else
         {
-            // 核心步骤：进入基于视觉残差的非线性图优化
+            // 💡【已删除恒速模型代码】：最新进来的帧不再强行加 delta_P 和 delta_R 推力
+            // 初始值直接继承上一帧优化出来的状态，完全交给 Ceres 视觉因子去拉动和解算
+            Ps[WINDOW_SIZE] = Ps[WINDOW_SIZE - 1];
+            Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
+
+            // 💡【逆深度初值保护】：在优化前，对于新滑入窗口的特征点或者深度未初始化的特征点，
+            // 利用当前窗口的相机位姿对其进行即时三角化，为其赋予合理的初值，代替盲目的默认值 1.0
+            for (auto &it : feature_manager)
+            {
+                auto &feature = it.second;
+                if (feature.estimated_depth == 1.0 && feature.feature_per_frame.size() >= 2)
+                {
+                    int i = feature.start_frame;
+                    int j = i + feature.feature_per_frame.size() - 1;
+                    if (j <= WINDOW_SIZE)
+                    {
+                        Eigen::Vector2d pt_i = feature.feature_per_frame[0].point;
+                        Eigen::Vector2d pt_j = feature.feature_per_frame.back().point;
+                        Eigen::Vector3d P_w = triangulatePoint(Rs[i], Ps[i], Rs[j], Ps[j], pt_i, pt_j);
+                        double depth = (Rs[i].transpose() * (P_w - Ps[i])).z();
+                        if (depth > 0.1)
+                        {
+                            feature.estimated_depth = 1.0 / depth;
+                        }
+                    }
+                }
+            }
+
             optimization();
-            // 优化完成后，滑动窗口，剔除或平移老状态
             slideWindow();
         }
     }
 }
 
-// 简化的纯视觉初始化结构
+// ==========================================
+// 3. 纯视觉滑窗 SfM 初始化
+// ==========================================
 bool Estimator::initialStructure()
 {
-    if (frame_count >= WINDOW_SIZE)
+    int l = 0; 
+    int r = WINDOW_SIZE;
+
+    std::vector<cv::Point2f> pts_l, pts_r;
+    std::vector<int> common_feature_ids;
+
+    for (const auto &it : feature_manager)
     {
-        // 纯视觉在没有IMU尺度时存在尺度不确定性，此处先默认位姿为初始递推值
-        return true;
+        const auto &feature = it.second;
+        if (feature.start_frame == l && feature.feature_per_frame.size() == (size_t)(r - l + 1))
+        {
+            pts_l.push_back(cv::Point2f(feature.feature_per_frame[0].point.x(), feature.feature_per_frame[0].point.y()));
+            pts_r.push_back(cv::Point2f(feature.feature_per_frame[r - l].point.x(), feature.feature_per_frame[r - l].point.y()));
+            common_feature_ids.push_back(feature.feature_id);
+        }
     }
-    return false;
+
+    if (pts_l.size() < 30)
+    {
+        std::cerr << "[SfM 失败] 共视特征点太少(" << pts_l.size() << ")，等待下一帧..." << std::endl;
+        return false;
+    }
+
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(pts_l, pts_r, 1.0, cv::Point2d(0, 0), cv::FM_RANSAC, 0.999, 0.003, mask);
+    
+    cv::Mat cv_R, cv_T;
+    cv::recoverPose(E, pts_l, pts_r, cv_R, cv_T, 1.0, cv::Point2d(0, 0), mask);
+
+    Rs[l].setIdentity();
+    Ps[l].setZero();
+
+    Eigen::Matrix3d R_r_to_l;
+    Eigen::Vector3d T_r_to_l;
+    cv2eigen(cv_R, cv_T, R_r_to_l, T_r_to_l);
+    
+    Rs[r] = Rs[l] * R_r_to_l.transpose();
+    Ps[r] = Ps[l] - Rs[r] * T_r_to_l;
+
+    std::map<int, Eigen::Vector3d> sfm_cloud; 
+    for (size_t i = 0; i < pts_l.size(); i++)
+    {
+        if (mask.at<uchar>(i) == 0) continue;
+
+        int feature_id = common_feature_ids[i];
+        Eigen::Vector2d pl(pts_l[i].x, pts_l[i].y);
+        Eigen::Vector2d pr(pts_r[i].x, pts_r[i].y);
+
+        Eigen::Vector3d P_w = triangulatePoint(Rs[l], Ps[l], Rs[r], Ps[r], pl, pr);
+        
+        double depth_l = (Rs[l].transpose() * (P_w - Ps[l])).z();
+        double depth_r = (Rs[r].transpose() * (P_w - Ps[r])).z();
+        
+        if (depth_l > 0.1 && depth_r > 0.1)
+        {
+            sfm_cloud[feature_id] = P_w;
+        }
+    }
+
+    for (int i = 1; i < r; i++)
+    {
+        std::vector<cv::Point3f> pts_3d;
+        std::vector<cv::Point2f> pts_2d;
+
+        for (const auto &it : feature_manager)
+        {
+            int feature_id = it.first;
+            const auto &feature = it.second;
+            
+            if (sfm_cloud.find(feature_id) != sfm_cloud.end() && i >= feature.start_frame && (size_t)(i - feature.start_frame) < feature.feature_per_frame.size())
+            {
+                Eigen::Vector3d P_w = sfm_cloud[feature_id];
+                pts_3d.push_back(cv::Point3f(P_w.x(), P_w.y(), P_w.z()));
+                
+                Eigen::Vector2d uv = feature.feature_per_frame[i - feature.start_frame].point;
+                pts_2d.push_back(cv::Point2f(uv.x(), uv.y()));
+            }
+        }
+
+        if (pts_3d.size() < 10)
+        {
+            std::cerr << "[SfM 失败] 中间帧 PnP 关联 3D 点太少！" << std::endl;
+            return false;
+        }
+
+        cv::Mat rvec, tvec;
+        cv::Mat K = (cv::Mat_<double>(3,3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);
+        cv::solvePnP(pts_3d, pts_2d, K, cv::Mat(), rvec, tvec, false, cv::SOLVEPNP_EPNP);
+        
+        cv::Mat R_cv;
+        cv::Rodrigues(rvec, R_cv);
+
+        Eigen::Matrix3d R_c_w;
+        Eigen::Vector3d T_c_w;
+        cv2eigen(R_cv, tvec, R_c_w, T_c_w);
+
+        Rs[i] = R_c_w.transpose();
+        Ps[i] = -R_c_w.transpose() * T_c_w;
+    }
+
+    for (auto &it : feature_manager)
+    {
+        int feature_id = it.first;
+        if (sfm_cloud.find(feature_id) != sfm_cloud.end())
+        {
+            Eigen::Vector3d P_w = sfm_cloud[feature_id];
+            int start_f = it.second.start_frame;
+            double depth = (Rs[start_f].transpose() * (P_w - Ps[start_f])).z();
+            it.second.estimated_depth = 1.0 / depth;
+        }
+        else
+        {
+            it.second.estimated_depth = 1.0;
+        }
+    }
+
+    std::cout << "[SfM 成功] 滑窗纯视觉初始结构构建完毕！" << std::endl;
+    return true;
 }
 
-// =========================================================================
-// 核心函数：构建非线性最小二乘问题，计算视觉残差并求解更新
-// =========================================================================
+// ==========================================
+// 4. 核心图优化与视觉残差计算
+// ==========================================
 void Estimator::optimization()
 {
-    std::cout << "[Optimizer] >>>>>>>> 开始构建纯视觉因子图优化 <<<<<<<<" << std::endl;
+    std::cout << "[Ceres Optimizer] Constructing Non-linear Factor Graph Optimization..." << std::endl;
 
     ceres::Problem problem;
-    
-    // 创建 Huber 鲁棒核函数，用于剔除前端光流追踪的误匹配点（Outliers）
     ceres::LossFunction *loss_function = new ceres::HuberLoss(1.0);
 
-    // 1. 将 Eigen 矩阵和四元数的状态量转为 Ceres 接收的 double 数组参数块
     double para_Pose[WINDOW_SIZE + 1][7];
 
     for (int i = 0; i <= WINDOW_SIZE; i++)
@@ -131,90 +304,72 @@ void Estimator::optimization()
         para_Pose[i][0] = Ps[i].x();
         para_Pose[i][1] = Ps[i].y();
         para_Pose[i][2] = Ps[i].z();
-        
         Eigen::Quaterniond q(Rs[i]);
         para_Pose[i][3] = q.x();
         para_Pose[i][4] = q.y();
         para_Pose[i][5] = q.z();
         para_Pose[i][6] = q.w();
-        
-        // 向 Ceres 添加滑窗内第 i 帧的位姿参数块
         problem.AddParameterBlock(para_Pose[i], 7);
     }
 
-    // 2. 将外参（Camera 到 IMU 的 R 和 T）转为参数块，并将其设置为【常量】不参与优化
     double para_Ex_Pose[7] = {TIC.x(), TIC.y(), TIC.z(), RIC(0, 0), RIC(1, 0), RIC(2, 0), 1.0};
     problem.AddParameterBlock(para_Ex_Pose, 7);
     problem.SetParameterBlockConstant(para_Ex_Pose);
 
-    // 3. 固定滑窗的第 0 帧位姿为【绝对基准】（不进行优化），防止全局轨迹整体发生无约束漂移
+    // 强行锁死滑窗第 0 帧位姿作为世界坐标系基准
     problem.SetParameterBlockConstant(para_Pose[0]);
 
-    // 4. 遍历特征点管理器，计算并注入所有视觉重投影残差因子
     int visual_factor_cnt = 0;
     for (auto &it : feature_manager)
     {
         auto &feature = it.second;
-        
-        // 如果一个特征点被滑窗内观测到的次数小于 2 次（即无法构成三角化约束），则跳过
         if (feature.feature_per_frame.size() < 2)
             continue;
 
-        // 获取该特征点第一次被看到的起始帧索引
         int i = feature.start_frame;
-        // 提取参考帧 i 对应的归一化像素坐标 pts_i
         Eigen::Vector2d pts_i = feature.feature_per_frame[0].point;
 
-        // 遍历该特征点在后续每一帧 j 中的观测记录，分别与参考帧 i 建立视觉重投影残差
         for (size_t idx = 1; idx < feature.feature_per_frame.size(); idx++)
         {
             int j = i + idx;
             if (j > WINDOW_SIZE)
                 continue;
 
-            // 提取当前帧 j 观测到的去畸变归一化像素坐标 pts_j
             Eigen::Vector2d pts_j = feature.feature_per_frame[idx].point;
 
-            // 利用我们在 projection_factor.h 中实现的静态工厂方法创建视觉残差代价函数
-            // 该代价函数内部会通过逆深度反投影、空间坐标系变换、再重投影，最终计算出 residuals 
+            // 调用 projection_factor.h 的重重投影误差代价函数
             ceres::CostFunction *f = ProjectionInverseDepthFactor::Create(pts_i, pts_j);
-            
-            // 将视觉重投影残差块加入 Ceres 求解器
-            // 关联的优化变量有：参考帧位姿、当前帧位姿、外参、以及该特征点的逆深度
             problem.AddResidualBlock(f, loss_function, para_Pose[i], para_Pose[j], para_Ex_Pose, &feature.estimated_depth);
             visual_factor_cnt++;
         }
     }
-    std::cout << "[Optimizer] 成功向非线性图优化中注入 " << visual_factor_cnt << " 个视觉重投影约束因子。" << std::endl;
+    std::cout << "[Ceres Optimizer] Added " << visual_factor_cnt << " Visual Projection Factors into Graph." << std::endl;
 
-    // 5. 配置 Ceres 求解器选项并调用 Solve 进行迭代优化
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_SCHUR; // 采用 Schur 消元法（Schur Complement）优先消去深度，极大加速求解
-    options.max_num_iterations = 10;                // 设置最大迭代次数
-    options.max_solver_time_in_seconds = 0.04;      // 限制单次最大求解时间，确保实时性
+    options.linear_solver_type = ceres::DENSE_SCHUR; // Schur 消元极大加速纯视觉问题求解
+    options.max_num_iterations = 10;
+    options.max_solver_time_in_seconds = 0.04;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    // 6. 优化结束，将优化后的最新参数块写回至后端核心状态量中，更新相机运动轨迹
+    // 优化状态写回
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
         Ps[i] = Eigen::Vector3d(para_Pose[i][0], para_Pose[i][1], para_Pose[i][2]);
         Eigen::Quaterniond q(para_Pose[i][6], para_Pose[i][3], para_Pose[i][4], para_Pose[i][5]);
         Rs[i] = q.toRotationMatrix();
     }
-    std::cout << "[Optimizer] 视觉非线性迭代完成。最新滑窗尾部相机位置 -> X: " 
-              << Ps[WINDOW_SIZE].x() << " Y: " << Ps[WINDOW_SIZE].y() << " Z: " << Ps[WINDOW_SIZE].z() << std::endl;
+    std::cout << "[Ceres Optimizer] Optimization done. Trajectory updated. Current X: " << Ps[WINDOW_SIZE].x() << " Y: " << Ps[WINDOW_SIZE].y() << " Z: " << Ps[WINDOW_SIZE].z() << std::endl;
 }
 
-// =========================================================================
-// 滑动窗口边缘化：剔除最老帧（Frame 0），保证系统内存和计算量的恒定
-// =========================================================================
+// ==========================================
+// 5. 滑动窗口维护（边缘化老帧）
+// ==========================================
 void Estimator::slideWindow()
 {
-    std::cout << "[Slide Window] 正在边缘化最老帧 (Frame 0) 以维持实时性..." << std::endl;
+    std::cout << "[Slide Window] Marginalizing the oldest frame (Frame 0)..." << std::endl;
 
-    // 1. 滑动窗口内的相机状态量整体向前平移一位（扔掉第 0 帧）
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         Headers[i] = Headers[i + 1];
@@ -222,37 +377,29 @@ void Estimator::slideWindow()
         Rs[i] = Rs[i + 1];
     }
 
-    // 2. 填充并复位滑窗尾部的空闲位置
     Headers[WINDOW_SIZE] = 0.0;
     Ps[WINDOW_SIZE] = Ps[WINDOW_SIZE - 1];
     Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
 
-    // 3. 核心步骤：维护地图特征点的生命周期与观测树结构
     for (auto it = feature_manager.begin(); it != feature_manager.end();)
     {
         auto &feature = it->second;
 
-        // 如果该点的起始帧是已经被剔除的第 0 帧
         if (feature.start_frame == 0)
         {
-            // 如果它不仅在第 0 帧被看到，在后面的帧也留有观测记录
             if (feature.feature_per_frame.size() > 1)
             {
-                // 抹去它在第 0 帧的观测，观测队列整体前移
                 feature.feature_per_frame.erase(feature.feature_per_frame.begin());
-                // 此时它在当前新滑窗中的起始帧依然变成了新的 0 帧
                 feature.start_frame = 0;
                 it++;
             }
             else
             {
-                // 如果它只在老第 0 帧被看到过，说明已经滑出窗口且无后续观测，直接从内存中删除
                 it = feature_manager.erase(it);
             }
         }
         else
         {
-            // 如果该点的起始帧不在第 0 帧，因为整个窗口前移了，其起始帧索引需要自减 1
             feature.start_frame--;
             it++;
         }
